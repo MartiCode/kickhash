@@ -25,6 +25,17 @@ type fileDesc struct {
 }
 
 
+// Given a file name, look for all files with same hash and size and return them all (including needle)
+func findSimular(haystack map[string]fileDesc, needleName string) []string {
+	ret := []string{}
+	for name, file := range haystack {
+		if file.Hash==haystack[needleName].Hash && file.Size==haystack[needleName].Size {
+			ret = append(ret, name)
+		}
+	}
+
+	return ret
+}
 
 
 func CreateMD5Hex(inputFilePath string) (string, error) {
@@ -49,32 +60,44 @@ func CreateMD5Hex(inputFilePath string) (string, error) {
 
 func main() {
 
-	hashName := flag.String("hashname", "hashes.csv", "Name of file that will record all hashes")
-	verbose :=  flag.Bool("verbose", false, "Verbose mode")
-	forceUpdate := flag.Bool("update", false, "Update the hash file even if an old one exists (will still report differences)")
+	// Parse command line flags
+	var (
+		hashName string
+		verbose bool
+		forceUpdate bool
+		doHidden bool
+		doDupes bool
+	)
+
+	flag.StringVar(&hashName, "hashname", "hashes.csv", "Name of file that will record all hashes")
+	flag.BoolVar(&verbose, "verbose", false, "Verbose mode")
+	flag.BoolVar(&forceUpdate, "update", false, "Update the hash file even if an old one exists (will still report differences)")
+	flag.BoolVar(&doHidden, "hidden", false, "Also process hidden files")
+	flag.BoolVar(&doDupes, "dupes", false, "Find and show duplicate files")
 	flag.Parse()
+
 
 	// Get directory to process
 	path := flag.Arg(0)
 	if (path=="") {
 		path, _ = os.Getwd()
 	}
-
 	path = filepath.Clean(path) + string(os.PathSeparator)
 	
-	// Verify path exists
+	// Verify directory actually exists
 	stat, err := os.Stat(path);
 	if os.IsNotExist(err) || !stat.IsDir() {
 		fmt.Println("Error! "+path+" is not a valid directory")
 		os.Exit(1)	
 	}
 
-	hashFileName := filepath.Join(path, *hashName) // location and name of reference hash file to read and/or write
+	// location and name of reference hash file to read and/or write
+	hashFileName := filepath.Join(path, hashName) 
 
 	// Two working modes: verify (expects to find a hash file and verify it against the files) or not (just compute all hashes and creates/overwrite a hash file)
 	verify := false
 
-	if (*verbose) {
+	if verbose {
 		fmt.Println("Path to process is "+ path)
 		fmt.Println("Hash file is "+hashFileName)
 	}
@@ -87,7 +110,7 @@ func main() {
 	reference := make(map[string]fileDesc)
 	file, err := os.Open(hashFileName)
     if err == nil {
-    	if *verbose {
+    	if verbose {
     		fmt.Println("Previous hash file found, checking changes...")
     	}
 
@@ -109,7 +132,7 @@ func main() {
 
         verify = true // we have a valid reference file! switch to verify mode
     } else {
-    	if *verbose {
+    	if verbose {
     		fmt.Println("No existing hash file found, creating new one")
     	}
     }
@@ -118,24 +141,32 @@ func main() {
 
 
     /*
-	 * Walk the directory
+	 * Walk the directory tree and compile a list of files
 	 */
 	
 	todo := make(map[string]fileDesc) // list of files found with their MD5 and size
-	
-
-	// Explore directory tree and collect list of files
 	err = filepath.Walk(path,
 		func(fileName string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
 
-			if (!info.IsDir() && *hashName!=info.Name()) {
-				shortName := strings.TrimPrefix(fileName, path)
-				todo[shortName] = fileDesc{ info.Size(), "" }
-
+			// Don't do directories or the hash file
+			if info.IsDir() || hashName==info.Name() {
+				return nil
 			}
+
+			// Also skip hidden files unless required
+			if !doHidden {
+				hidden, e := IsHiddenFile(fileName) 
+
+				if hidden || e!=nil {
+					return nil
+				}
+			}
+
+			shortName := strings.TrimPrefix(fileName, path)
+			todo[shortName] = fileDesc{ info.Size(), "" }
 
 			return nil
 	})
@@ -145,6 +176,10 @@ func main() {
 		os.Exit(1)
 	}
 
+
+	/*
+	 * Actually hash all the files and figure out the differences
+	 */
 
 	bar := progressbar.NewOptions(len(todo),
 		progressbar.OptionShowBytes(false),
@@ -158,7 +193,13 @@ func main() {
 	for shortName, rec := range todo {
 
 		bar.Add(1)
-		bar.AddDetail("Hashing "+shortName)
+		if len(shortName)<=70 {
+			bar.AddDetail("Hashing "+shortName)
+		} else {
+			bar.AddDetail("Hashing "+fmt.Sprintf("%.70s", filepath.Base(shortName)))
+		}
+
+
 		md5, err := CreateMD5Hex(path + shortName)
 
 		if err != nil {
@@ -178,59 +219,9 @@ func main() {
 				}
 				delete(reference, shortName)
 			}
-
 		}
 
 	}
-
-
-/*
-	err = filepath.Walk(path,
-		func(fileName string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-
-			if (!info.IsDir() && *hashName!=info.Name()) {
-			
-				shortName := strings.TrimPrefix(fileName, path)
-
-				bar.Add(1)
-				bar.AddDetail("Hashing "+shortName)
-				md5, err := CreateMD5Hex(fileName)
-
-				if err != nil {
-					fileProblem = append(fileProblem, shortName)
-				}
-
-				total+= uint64(info.Size())
-
-				if verify {
-					old, found := reference[shortName]
-					if !found {
-						fileAdded = append(fileAdded, shortName)
-					} else {
-						if old.Hash!=md5 || old.Size!=info.Size() {
-							fileChanged = append(fileChanged, shortName)
-						}
-						delete(reference, shortName)
-					}
-
-				}
-			
-				todo[shortName] = fileDesc{ info.Size(), md5 }
-			}
-		
-			return nil
-	})
-
-
-	if err != nil {
-		fmt.Println("Error! Could not process directory "+ path)
-		os.Exit(1)
-	}
-*/
-	
 
 
 	bar.Finish()
@@ -238,9 +229,10 @@ func main() {
 
 
 	/*
-	 * If not verifying or forced, write new hash file
+	 * If not verifying, or if forced-update, write new hash file
 	 */
-	if (!verify || *forceUpdate) && len(todo)>0 {
+
+	if (!verify || forceUpdate) && len(todo)>0 {
 
 		file, err = os.Create(hashFileName)
 		if err != nil {
@@ -268,6 +260,7 @@ func main() {
 	/**
 	 * If verifying, show result of comparison
 	 */
+
 	if verify {
 
 		if len(fileAdded)>0 {
@@ -297,9 +290,33 @@ func main() {
 
 	}
 
-	if *verbose {
-		fmt.Println("Hashed "+humanize.Bytes(total))
+
+
+	/**
+	 * Show duplicates
+	 */
+	if doDupes {
+
+		names := slices.Collect(maps.Keys(todo))
+		for len(names)>0 {
+			arr := findSimular(todo, names[0])
+			if len(arr)>1 {
+				fmt.Println("These files appear identical:")
+				for _, f := range arr {
+					fmt.Println(" "+f)
+				}
+			}
+
+			names = slices.DeleteFunc(names, func (cmp string) bool {
+				return slices.Contains(arr, cmp)
+			})
+		}
+
 	}
 
+
+	if verbose {
+		fmt.Println("Hashed "+humanize.Bytes(total))
+	}
 
 }

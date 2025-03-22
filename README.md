@@ -19,3 +19,7 @@ Use `kickhash -h` for help.
 `kickhash -update` will update the csv file if one exists on top of reporting changes.
 
 `kickhash -verbose` will produce more verbose output of what is going on.
+
+`kickhash -hidden` will also include hidden files
+
+`kickhash -dupes` also finds and reports duplicate files
