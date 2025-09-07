@@ -25,16 +25,21 @@ type fileDesc struct {
 }
 
 
-// Given a file name, look for all files with same hash and size and return them all (including needle)
-func findSimular(haystack map[string]fileDesc, needleName string) []string {
-	ret := []string{}
-	for name, file := range haystack {
-		if file.Hash==haystack[needleName].Hash && file.Size==haystack[needleName].Size {
-			ret = append(ret, name)
-		}
+func findDuplicates(haystack map[string]fileDesc) map[string][]string {
+	hashToFiles := make(map[string][]string)
+
+	for filename, info := range haystack {
+		key := fmt.Sprintf("%s:%d", info.Hash, info.Size)
+		hashToFiles[key] = append(hashToFiles[key], filename)
 	}
 
-	return ret
+	duplicates := make(map[string][]string)
+	for key, filenames := range hashToFiles {
+		if len(filenames)>1 {
+			duplicates[key] = filenames
+		}
+	}
+	return duplicates
 }
 
 
@@ -60,20 +65,25 @@ func CreateMD5Hex(inputFilePath string) (string, error) {
 
 func main() {
 
-	// Parse command line flags
-	var (
-		hashName string
-		verbose bool
-		forceUpdate bool
-		doHidden bool
-		doDupes bool
-	)
+	// All config values
+	config := struct{
+		hashName	string
+		verbose		bool
+		forceUpdate	bool
+		doHidden	bool
+		doDupes		bool
+		verify		bool
+	}{
+		// Two working modes: verify (expects to find a hash file and verify it against the files) or not (just compute all hashes and creates/overwrite a hash file)
+		verify: false,
+	}
 
-	flag.StringVar(&hashName, "hashname", "hashes.csv", "Name of file that will record all hashes")
-	flag.BoolVar(&verbose, "verbose", false, "Verbose mode")
-	flag.BoolVar(&forceUpdate, "update", false, "Update the hash file even if an old one exists (will still report differences)")
-	flag.BoolVar(&doHidden, "hidden", false, "Also process hidden files")
-	flag.BoolVar(&doDupes, "dupes", false, "Find and show duplicate files")
+	// Parse command line flags
+	flag.StringVar(&config.hashName, "hashname", "hashes.csv", "Name of file that will record all hashes")
+	flag.BoolVar(&config.verbose, "verbose", false, "Verbose mode")
+	flag.BoolVar(&config.forceUpdate, "update", false, "Update the hash file even if an old one exists (will still report differences)")
+	flag.BoolVar(&config.doHidden, "hidden", false, "Also process hidden files")
+	flag.BoolVar(&config.doDupes, "dupes", false, "Find and show duplicate files")
 	flag.Parse()
 
 
@@ -92,12 +102,9 @@ func main() {
 	}
 
 	// location and name of reference hash file to read and/or write
-	hashFileName := filepath.Join(path, hashName) 
+	hashFileName := filepath.Join(path, config.hashName) 
 
-	// Two working modes: verify (expects to find a hash file and verify it against the files) or not (just compute all hashes and creates/overwrite a hash file)
-	verify := false
-
-	if verbose {
+	if config.verbose {
 		fmt.Println("Path to process is "+ path)
 		fmt.Println("Hash file is "+hashFileName)
 	}
@@ -110,7 +117,9 @@ func main() {
 	reference := make(map[string]fileDesc)
 	file, err := os.Open(hashFileName)
     if err == nil {
-    	if verbose {
+    	defer file.Close()
+
+    	if config.verbose {
     		fmt.Println("Previous hash file found, checking changes...")
     	}
 
@@ -130,20 +139,18 @@ func main() {
         	reference[line[0]] = fileDesc{ size, line[2]  }
         }
 
-        verify = true // we have a valid reference file! switch to verify mode
+        config.verify = true // we have a valid reference file! switch to verify mode
     } else {
-    	if verbose {
+    	if config.verbose {
     		fmt.Println("No existing hash file found, creating new one")
     	}
     }
-    defer file.Close()
-
+    
 
 
     /*
 	 * Walk the directory tree and compile a list of files
-	 */
-	
+	 */	
 	todo := make(map[string]fileDesc) // list of files found with their MD5 and size
 	err = filepath.Walk(path,
 		func(fileName string, info os.FileInfo, err error) error {
@@ -152,12 +159,12 @@ func main() {
 			}
 
 			// Don't do directories or the hash file
-			if info.IsDir() || hashName==info.Name() {
+			if info.IsDir() || config.hashName==info.Name() {
 				return nil
 			}
 
 			// Also skip hidden files unless required
-			if !doHidden {
+			if !config.doHidden {
 				hidden, e := IsHiddenFile(fileName) 
 
 				if hidden || e!=nil {
@@ -200,16 +207,17 @@ func main() {
 		}
 
 
-		md5, err := CreateMD5Hex(path + shortName)
+		md5, err := CreateMD5Hex(filepath.Join(path,shortName))
 
 		if err != nil {
 			fileProblem = append(fileProblem, shortName)
+			continue
 		}
 
 		total+= uint64(rec.Size)
 		todo[shortName] = fileDesc{ rec.Size, md5 }
 
-		if verify {
+		if config.verify {
 			old, found := reference[shortName]
 			if !found {
 				fileAdded = append(fileAdded, shortName)
@@ -225,14 +233,13 @@ func main() {
 
 
 	bar.Finish()
-	fmt.Println("") // progress bar seems to not add a line feed
+	fmt.Println() // progress bar seems to not add a line feed
 
 
 	/*
 	 * If not verifying, or if forced-update, write new hash file
 	 */
-
-	if (!verify || forceUpdate) && len(todo)>0 {
+	if (!config.verify || config.forceUpdate) && len(todo)>0 {
 
 		file, err = os.Create(hashFileName)
 		if err != nil {
@@ -257,11 +264,11 @@ func main() {
 	}
 
 
+
 	/**
 	 * If verifying, show result of comparison
 	 */
-
-	if verify {
+	if config.verify {
 
 		if len(fileAdded)>0 {
 			fmt.Println(len(fileAdded), " file(s) are new:")
@@ -284,6 +291,13 @@ func main() {
 			}
 		}
 
+		if len(fileProblem)>0 {
+			fmt.Println(len(fileProblem), "file(s) had errors:")
+			for _, name := range fileProblem {
+				fmt.Println(" ", name)
+			}
+		}
+
 		if len(fileAdded)+len(fileChanged)+len(reference)==0 {
 			fmt.Println("No change found")
 		}
@@ -295,27 +309,25 @@ func main() {
 	/**
 	 * Show duplicates
 	 */
-	if doDupes {
+	if config.doDupes {
 
-		names := slices.Collect(maps.Keys(todo))
-		for len(names)>0 {
-			arr := findSimular(todo, names[0])
-			if len(arr)>1 {
+		duplicates := findDuplicates(todo)
+
+		if len(duplicates)==0 {
+			fmt.Println("No duplicate files found")
+		} else {
+			fmt.Printf("Found %d groups of duplicate files:\n", len(duplicates))
+			for _, filenames := range duplicates {
 				fmt.Println("These files appear identical:")
-				for _, f := range arr {
-					fmt.Println(" "+f)
+				for _, f := range filenames {
+					fmt.Println(" ", f)
 				}
 			}
-
-			names = slices.DeleteFunc(names, func (cmp string) bool {
-				return slices.Contains(arr, cmp)
-			})
 		}
-
 	}
 
 
-	if verbose {
+	if config.verbose {
 		fmt.Println("Hashed "+humanize.Bytes(total))
 	}
 
