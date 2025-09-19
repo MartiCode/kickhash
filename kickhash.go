@@ -11,11 +11,15 @@ import (
 	"maps"
 	"encoding/hex"
 	"encoding/csv"
-    "path/filepath"
-    "crypto/md5"
+	"path/filepath"
+	"hash"
+	"hash/crc32"
+	"crypto/md5"
+	"crypto/sha256"
 
-    "github.com/schollz/progressbar/v3"
-    "github.com/dustin/go-humanize"
+	"github.com/zeebo/xxh3"
+	"github.com/schollz/progressbar/v3"
+	"github.com/dustin/go-humanize"
 )
 
 
@@ -43,20 +47,39 @@ func findDuplicates(haystack map[string]fileDesc) map[string][]string {
 }
 
 
-func CreateMD5Hex(inputFilePath string) (string, error) {
+// Return a hasher object based on algorithm name (md5 being the default)
+func CreateHasher(algo string) hash.Hash {
+	if algo=="crc32" {
+		return crc32.NewIEEE()
+	}
+
+	if algo=="xxhash64" {
+		return xxh3.New()
+	}
+
+	if algo=="sha256" {
+		return sha256.New()
+	}
+
+	return md5.New()
+}
+
+
+// Returns hexadecimal hash value of a file given as specific hasher
+func CreateHashHex(inputFilePath string, hasher hash.Hash) (string, error) {
 	var file, err = os.Open(inputFilePath)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
 
-	var hash = md5.New()
-	_, err = io.Copy(hash, file)
+	hasher.Reset()
+	_, err = io.Copy(hasher, file)
 	if err != nil {
 		return "", err
 	}
 
-	var bytesHash = hash.Sum(nil)
+	var bytesHash = hasher.Sum(nil)
 	return hex.EncodeToString(bytesHash[:]), nil
 }
 
@@ -64,6 +87,12 @@ func CreateMD5Hex(inputFilePath string) (string, error) {
 
 
 func main() {
+
+
+	/*
+	 * Process the command line and options
+	 */
+
 
 	// All config values
 	config := struct{
@@ -73,6 +102,7 @@ func main() {
 		doHidden	bool
 		doDupes		bool
 		verify		bool
+		hashAlgo	string
 	}{
 		// Two working modes: verify (expects to find a hash file and verify it against the files) or not (just compute all hashes and creates/overwrite a hash file)
 		verify: false,
@@ -84,25 +114,34 @@ func main() {
 	flag.BoolVar(&config.forceUpdate, "update", false, "Update the hash file even if an old one exists (will still report differences)")
 	flag.BoolVar(&config.doHidden, "hidden", false, "Also process hidden files")
 	flag.BoolVar(&config.doDupes, "dupes", false, "Find and show duplicate files")
+	flag.StringVar(&config.hashAlgo, "hash", "md5", "Hash algorithm (autodetected if an existing hash file exists), one of: crc32, xxhash64, md5, sha256")
 	flag.Parse()
 
 
-	// Get directory to process
+	// Get directory to process, either command line or current working dir
 	path := flag.Arg(0)
 	if (path=="") {
 		path, _ = os.Getwd()
 	}
 	path = filepath.Clean(path) + string(os.PathSeparator)
 	
-	// Verify directory actually exists
+	// Verify the directory actually exists
 	stat, err := os.Stat(path);
 	if os.IsNotExist(err) || !stat.IsDir() {
 		fmt.Println("Error! "+path+" is not a valid directory")
-		os.Exit(1)	
+		os.Exit(1)
 	}
 
 	// location and name of reference hash file to read and/or write
 	hashFileName := filepath.Join(path, config.hashName) 
+
+	// Hash functiont to use
+	config.hashAlgo = strings.ToLower(config.hashAlgo)
+	if config.hashAlgo!="crc32" && config.hashAlgo!="xxhash64" && config.hashAlgo!="sha256" {
+		config.hashAlgo = "md5"
+	}
+
+
 
 	if config.verbose {
 		fmt.Println("Path to process is "+ path)
@@ -110,45 +149,70 @@ func main() {
 	}
 
 
-
 	/*
 	 * Open any existing hash reference file
 	 */
 	reference := make(map[string]fileDesc)
 	file, err := os.Open(hashFileName)
-    if err == nil {
-    	defer file.Close()
+	if err == nil {
+		defer file.Close()
 
-    	if config.verbose {
-    		fmt.Println("Previous hash file found, checking changes...")
-    	}
+		if config.verbose {
+			fmt.Println("Previous hash file found, checking changes against it...")
+		}
 
-    	reader := csv.NewReader(file)
-    	reader.Comma = '\t'
-        lines, err := reader.ReadAll()
-        if err!=nil {
-        	fmt.Println("Error: cannot read existing hash file")
-        	os.Exit(2)
-        }
-        for _, line := range lines {
-        	size, err := strconv.ParseInt(line[1], 10, 64)
-        	if (err!=nil) {
-        		fmt.Println("Error: there was a problem decoding existing hash file")
-        		os.Exit(2)
-        	}
-        	reference[line[0]] = fileDesc{ size, line[2]  }
-        }
+		reader := csv.NewReader(file)
+		reader.Comma = '\t'
+		lines, err := reader.ReadAll()
+		if err!=nil {
+			fmt.Println("Error: cannot read existing hash file")
+			os.Exit(2)
+		}
+		for _, line := range lines {
+			size, err := strconv.ParseInt(line[1], 10, 64)
+			if (err!=nil) {
+				fmt.Println("Error: there was a problem decoding existing hash file")
+				os.Exit(2)
+			}
+			reference[line[0]] = fileDesc{ size, line[2]  }
+		}
 
-        config.verify = true // we have a valid reference file! switch to verify mode
-    } else {
-    	if config.verbose {
-    		fmt.Println("No existing hash file found, creating new one")
-    	}
-    }
+		config.verify = true // we have a valid reference file! switch to verify mode
+
+		// Override hash algorithm based on hash values length that are in the CSV file
+		for _, x := range reference {
+			if len(x.Hash)==8 {
+				config.hashAlgo = "crc32"
+			} else if len(x.Hash)==16 {
+				config.hashAlgo = "xxhash64"
+			} else if len(x.Hash)==32 {
+				config.hashAlgo = "md5"
+			} else if len(x.Hash)==64 {
+				config.hashAlgo = "sha256"
+			} else {
+				fmt.Println("Error: hashes in hash file are of the wrong format")
+				os.Exit(2)
+			}
+
+			break // only need to do this once
+		}
+
+	} else {
+		if config.verbose {
+			fmt.Println("No existing hash file found, creating new one")
+		}
+	}
+
+
+	if config.verbose {
+		fmt.Println("Hash algorithm is "+config.hashAlgo)		
+	}
+
+
     
 
 
-    /*
+	/*
 	 * Walk the directory tree and compile a list of files
 	 */	
 	todo := make(map[string]fileDesc) // list of files found with their MD5 and size
@@ -197,6 +261,8 @@ func main() {
 
 	fileChanged, fileAdded, fileProblem := []string{}, []string{}, []string{} // All the files that appear to have been changed, added or had issues
 	var total uint64 = 0
+	hasher := CreateHasher(config.hashAlgo)
+	
 	for shortName, rec := range todo {
 
 		bar.Add(1)
@@ -205,9 +271,8 @@ func main() {
 		} else {
 			bar.AddDetail("Hashing "+fmt.Sprintf("%.70s", filepath.Base(shortName)))
 		}
-
-
-		md5, err := CreateMD5Hex(filepath.Join(path,shortName))
+		
+		hashString, err := CreateHashHex(filepath.Join(path,shortName), hasher)
 
 		if err != nil {
 			fileProblem = append(fileProblem, shortName)
@@ -215,14 +280,14 @@ func main() {
 		}
 
 		total+= uint64(rec.Size)
-		todo[shortName] = fileDesc{ rec.Size, md5 }
+		todo[shortName] = fileDesc{ rec.Size, hashString }
 
 		if config.verify {
 			old, found := reference[shortName]
 			if !found {
 				fileAdded = append(fileAdded, shortName)
 			} else {
-				if old.Hash!=md5 || old.Size!=rec.Size {
+				if old.Hash!=hashString || old.Size!=rec.Size {
 					fileChanged = append(fileChanged, shortName)
 				}
 				delete(reference, shortName)

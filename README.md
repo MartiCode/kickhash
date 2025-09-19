@@ -24,4 +24,6 @@ Use `kickhash -h` for help.
 
 `kickhash -hashname some_name.csv` will use a different name for the csv file than the default.
 
+`kickhash -hash algo_name` will change the hashing algorithm, which can be one of: crc32, xxhash64, md5 or sha256 (respectively 32, 64, 128 or 256 bits, with md5 being the default). This is only needed on a first run - if a hash file already exists, the algorithm will be selected based on the existing hash length.
+
 `kickhash -verbose` will produce more verbose output of what is going on.
